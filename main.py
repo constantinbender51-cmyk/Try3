@@ -92,7 +92,13 @@ def deriveround(ohlc_data, a):
         for j in range(4): 
             if prev[j] == 0: change = 0.0
             else: change = ((curr[j] - prev[j]) / prev[j]) * 100.0
-            rounded = math.floor(change / a) * a
+            
+            # Modified rounding logic: Floor for positive, Ceiling for negative
+            if change >= 0:
+                rounded = math.floor(change / a) * a
+            else:
+                rounded = math.ceil(change / a) * a
+                
             d_row.append(rounded)
         derived.append(tuple(d_row))
     return derived
