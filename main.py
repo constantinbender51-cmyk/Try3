@@ -16,15 +16,15 @@ DATA_DIR = '/app/data'
 # Grid Search Parameter Space
 PARAMS = {
     'SYMBOL': ['BTCUSDT', 'ETHUSDT', 'XRPUSDT'],
-    'TIMEFRAME': ['1m', '5m', '15m', '30m', '1h', '4h', '1d'],
+    # Updated: Timeframes start from 1h onward
+    'TIMEFRAME': ['1h', '2h', '4h', '6h', '8h', '12h', '1d'],
     'START_YEAR': ['2020', '2021', '2022', '2023'],
     'END_YEAR': ['2024', '2025', '2026'],
     'A_ROUND': [1.024, 0.512, 0.256, 0.128, 0.064, 0.032, 0.016, 0.008, 0.004, 0.002],
     'C_TOP': [2, 4, 8, 16, 32],
     'D_LEN': [2, 3, 4, 5],
     'E_SIM': [0, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32],
-    # Fixed for Grid Search (standard train/test split within the selected range)
-    'B_SPLIT': [70] 
+    'B_SPLIT': [70]
 }
 
 # ==========================================
@@ -37,13 +37,16 @@ def ensure_data_dir():
 
 def get_pandas_freq(tf):
     """Maps custom timeframe string to Pandas offset alias."""
-    if tf == '1m': return '1T'
-    if tf == '5m': return '5T'
-    if tf == '15m': return '15T'
-    if tf == '30m': return '30T'
-    if tf == '1h': return '1H'
-    if tf == '4h': return '4H'
-    if tf == '1d': return '1D'
+    # Minutes
+    if tf.endswith('m'): 
+        return tf.replace('m', 'T')
+    # Hours
+    if tf.endswith('h'): 
+        return tf.replace('h', 'H').upper()
+    # Days
+    if tf.endswith('d'): 
+        return tf.replace('d', 'D').upper()
+    
     return '1H'
 
 def fetch_1m_data(symbol, start_year=2020, end_year=2026):
@@ -123,29 +126,27 @@ def get_resampled_data(df_1m, timeframe, start_date_str, end_date_str):
         return []
 
     # 2. Resample
-    if timeframe != '1m':
-        freq = get_pandas_freq(timeframe)
-        agg_dict = {
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last'
-        }
-        df_resampled = df_subset.resample(freq).agg(agg_dict).dropna()
-    else:
-        df_resampled = df_subset
+    # If timeframe is 1m, no change needed (though logic handles it via '1T')
+    freq = get_pandas_freq(timeframe)
+    agg_dict = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last'
+    }
+    # dropna() removes empty bins (e.g. maintenance gaps)
+    df_resampled = df_subset.resample(freq).agg(agg_dict).dropna()
 
     # 3. Convert to list of lists [O, H, L, C] for existing logic
     return df_resampled[['open', 'high', 'low', 'close']].values.tolist()
 
 # ==========================================
-# ALGORITHM CORE (MODIFIED)
+# ALGORITHM CORE
 # ==========================================
 
 def deriveround(ohlc_data, a):
     """
-    Updated rounding: round(change/a) * a
-    Example: 0.4 -> 0, 0.6 -> 1, -0.6 -> -1
+    Standard rounding: round(change/a) * a
     """
     derived = []
     for i in range(1, len(ohlc_data)):
@@ -193,7 +194,7 @@ def is_similar(seq1, seq2, e):
 
 def backtest(test_data, top_sequences, d, e):
     """
-    Returns stats dict: {accuracy, trade_count, pnl}
+    Returns stats dict: {accuracy, trades, pnl}
     """
     valid = 0
     correct = 0
@@ -234,7 +235,7 @@ def backtest(test_data, top_sequences, d, e):
 def main():
     ensure_data_dir()
     
-    # 1. Fetch/Load Master Data for all Symbols
+    # 1. Fetch/Load Master Data for all Symbols (1m Data)
     master_data = {}
     for sym in PARAMS['SYMBOL']:
         # Fetching strictly 2020-2026 as base
@@ -246,7 +247,6 @@ def main():
         'A_ROUND', 'C_TOP', 'D_LEN', 'E_SIM', 'B_SPLIT'
     ]
     
-    # Create permutation list
     combinations = list(itertools.product(*[PARAMS[k] for k in keys]))
     total_combos = len(combinations)
     
@@ -261,14 +261,13 @@ def main():
     
     # 3. Loop
     for idx, combo in enumerate(combinations):
-        # Unpack
         p = dict(zip(keys, combo))
         
         # Validation: End Year > Start Year
         if int(p['END_YEAR']) <= int(p['START_YEAR']):
             continue
             
-        # Prepare Data
+        # Prepare Data (Resample 1m to Target Timeframe)
         start_date = f"{p['START_YEAR']}-01-01"
         end_date = f"{p['END_YEAR']}-12-31"
         
@@ -294,7 +293,6 @@ def main():
         stats = backtest(test, top_seqs, p['D_LEN'], p['E_SIM'])
         
         # Optimization Metric: Accuracy * Trades
-        # (Using raw accuracy 0.0-1.0 * count)
         score = stats['accuracy'] * stats['trades']
         
         if score > best_score:
