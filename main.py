@@ -13,18 +13,18 @@ import threading
 # ==========================================
 # PARAMETERS
 # ==========================================
-TIMEFRAME = '1h'       # e.g., '1m', '5m', '1h', '1d'
-SYMBOL = 'BTCUSDT'     # Binance symbol
-START = '2023-01-01'   # Training/Backtest Start
-END = '2023-06-01'     # Training/Backtest End
+TIMEFRAME = os.getenv('TIMEFRAME', '1h')       # e.g., '1m', '5m', '1h', '1d'
+SYMBOL = os.getenv('SYMBOL', 'BTCUSDT')        # Binance symbol
+START = os.getenv('START', '2023-01-01')       # Training/Backtest Start
+END = os.getenv('END', '2023-06-01')           # Training/Backtest End
 
-A_ROUND = 0.5          # a%: Rounding step (floor)
-B_SPLIT = 70           # b%: Percentage of data for Split 1 (Training)
-C_TOP = 10             # c%: Percentage of top frequent sequences to keep
-D_LEN = 3              # d: Total length of candle sequence
-E_SIM = 0.1            # e%: Similarity threshold (0.1 = 10% difference)
+A_ROUND = float(os.getenv('A_ROUND', '0.5'))   # a%: Rounding step (floor)
+B_SPLIT = int(os.getenv('B_SPLIT', '70'))      # b%: Percentage of data for Split 1 (Training)
+C_TOP = int(os.getenv('C_TOP', '10'))          # c%: Percentage of top frequent sequences to keep
+D_LEN = int(os.getenv('D_LEN', '3'))           # d: Total length of candle sequence
+E_SIM = float(os.getenv('E_SIM', '0.1'))       # e%: Similarity threshold (0.1 = 10% difference)
 
-PORT = 8080
+PORT = int(os.getenv('PORT', '8080'))
 
 # ==========================================
 # GLOBAL STATE FOR LIVE TRADING
