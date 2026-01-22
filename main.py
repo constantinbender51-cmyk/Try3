@@ -9,29 +9,53 @@ import os
 from datetime import datetime, timedelta
 import time
 import threading
+import random
+import copy
 
 # ==========================================
-# PARAMETERS
+# PARAMETERS (DEFAULTS / OVERWRITTEN BY GA)
 # ==========================================
-TIMEFRAME = os.getenv('TIMEFRAME', '1h')       # e.g., '1m', '5m', '1h', '1d'
-SYMBOL = os.getenv('SYMBOL', 'BTCUSDT')        # Binance symbol
-START = os.getenv('START', '2023-01-01')       # Training/Backtest Start
-END = os.getenv('END', '2023-06-01')           # Training/Backtest End
+TIMEFRAME = os.getenv('TIMEFRAME', '1h')       
+SYMBOL = os.getenv('SYMBOL', 'BTCUSDT')        
+START = os.getenv('START', '2023-01-01')       
+END = os.getenv('END', '2023-06-01')           
 
-A_ROUND = float(os.getenv('A_ROUND', '0.5'))   # a%: Rounding step (floor)
-B_SPLIT = int(os.getenv('B_SPLIT', '70'))      # b%: Percentage of data for Split 1 (Training)
-C_TOP = int(os.getenv('C_TOP', '10'))          # c%: Percentage of top frequent sequences to keep
-D_LEN = int(os.getenv('D_LEN', '3'))           # d: Total length of candle sequence
-E_SIM = float(os.getenv('E_SIM', '0.1'))       # e%: Similarity threshold (0.1 = 10% difference)
+A_ROUND = float(os.getenv('A_ROUND', '0.5'))   
+B_SPLIT = int(os.getenv('B_SPLIT', '70'))      # Fixed at 70% as per instructions (not in GA)
+C_TOP = int(os.getenv('C_TOP', '10'))          
+D_LEN = int(os.getenv('D_LEN', '3'))           
+E_SIM = float(os.getenv('E_SIM', '0.1'))       
 
 PORT = int(os.getenv('PORT', '8080'))
 
 # ==========================================
+# GENETIC ALGORITHM CONFIGURATION
+# ==========================================
+GA_POPULATION = 10      # Size of population
+GA_GENERATIONS = 3      # Number of generations
+GA_MUTATION_RATE = 0.2  # Probability of mutation
+
+# Allowed Ranges
+GA_RANGES = {
+    'A_ROUND': (0.001, 10.0),
+    'C_TOP': (1, 50),
+    'D_LEN': (2, 7),
+    'E_SIM': (0.0, 0.5),
+    'TIMEFRAME': ['30m', '1h', '4h', '1d'],
+    'START': ['2018-01-01', '2019-01-01', '2020-01-01', '2021-01-01', '2022-01-01', '2023-01-01'],
+    'END': ['2023-06-01', '2024-06-01', '2025-06-01'],
+    'SYMBOL': ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'SOLUSDT', 'LINKUSDT', 'DOGEUSDT']
+}
+
+# Cache for fetched data to speed up GA
+DATA_CACHE = {} 
+
+# ==========================================
 # GLOBAL STATE FOR LIVE TRADING
 # ==========================================
-LIVE_RESULTS = []      # Stores completed live trades
-PENDING_TRADES = []    # Stores active predictions waiting for outcome
-IS_RUNNING = True      # Thread control
+LIVE_RESULTS = []      
+PENDING_TRADES = []    
+IS_RUNNING = True      
 
 # ==========================================
 # HELPER FUNCTIONS
@@ -48,6 +72,11 @@ def get_timeframe_seconds(tf):
 
 def fetch(timeframe, symbol, start, end, limit=1000, quiet=False):
     """Fetches OHLC data from Binance."""
+    # Check Cache first (for GA speed)
+    cache_key = f"{symbol}_{timeframe}_{start}_{end}"
+    if cache_key in DATA_CACHE:
+        return DATA_CACHE[cache_key]
+
     base_url = "https://api.binance.com/api/v3/klines"
     
     # Handle string or datetime
@@ -81,6 +110,8 @@ def fetch(timeframe, symbol, start, end, limit=1000, quiet=False):
             print(f"Error: {e}")
             break
             
+    # Save to cache
+    DATA_CACHE[cache_key] = data
     return data
 
 def deriveround(ohlc_data, a):
@@ -141,6 +172,123 @@ def completesimilarbeginnings(test_data, top_sequences, d, e):
         if pred is not None:
             predictions.append((pred, outcome[3]))
     return predictions
+
+# ==========================================
+# GENETIC ALGORITHM LOGIC
+# ==========================================
+
+def generate_random_genome():
+    """Creates a random set of parameters."""
+    return {
+        'A_ROUND': random.uniform(*GA_RANGES['A_ROUND']),
+        'C_TOP': random.randint(*GA_RANGES['C_TOP']),
+        'D_LEN': random.randint(*GA_RANGES['D_LEN']),
+        'E_SIM': random.uniform(*GA_RANGES['E_SIM']),
+        'TIMEFRAME': random.choice(GA_RANGES['TIMEFRAME']),
+        'START': random.choice(GA_RANGES['START']),
+        'END': random.choice(GA_RANGES['END']),
+        'SYMBOL': random.choice(GA_RANGES['SYMBOL'])
+    }
+
+def evaluate_fitness(genome):
+    """Calculates PnL on the Test Split for a given genome."""
+    try:
+        # Fetch Data
+        raw = fetch(genome['TIMEFRAME'], genome['SYMBOL'], genome['START'], genome['END'], quiet=True)
+        if not raw or len(raw) < 50: return -99999.0 # Penalize empty/short data
+        
+        # Process
+        derived = deriveround(raw, genome['A_ROUND'])
+        train, test = split(derived, B_SPLIT) # B_SPLIT is fixed global
+        
+        if len(train) < genome['D_LEN'] or len(test) < genome['D_LEN']: return -99999.0
+
+        top_seqs = gettop(train, genome['C_TOP'], genome['D_LEN'])
+        if not top_seqs: return -99999.0
+        
+        results = completesimilarbeginnings(test, top_seqs, genome['D_LEN'], genome['E_SIM'])
+        
+        # Calculate PnL
+        pnl = 0.0
+        if not results: return 0.0
+        
+        for pred, actual in results:
+             # Basic direction strategy: Long if pred > 0, Short if pred < 0
+             if pred == 0: continue
+             trade_pnl = (1 if pred > 0 else -1) * actual
+             pnl += trade_pnl
+             
+        return pnl
+    except Exception as e:
+        return -99999.0
+
+def crossover(p1, p2):
+    """Uniform crossover."""
+    child = {}
+    for key in p1:
+        if random.random() > 0.5:
+            child[key] = p1[key]
+        else:
+            child[key] = p2[key]
+    return child
+
+def mutate(genome):
+    """Randomly mutates genes."""
+    for key in genome:
+        if random.random() < GA_MUTATION_RATE:
+            if key == 'A_ROUND': genome[key] = random.uniform(*GA_RANGES['A_ROUND'])
+            elif key == 'C_TOP': genome[key] = random.randint(*GA_RANGES['C_TOP'])
+            elif key == 'D_LEN': genome[key] = random.randint(*GA_RANGES['D_LEN'])
+            elif key == 'E_SIM': genome[key] = random.uniform(*GA_RANGES['E_SIM'])
+            elif key == 'TIMEFRAME': genome[key] = random.choice(GA_RANGES['TIMEFRAME'])
+            elif key == 'START': genome[key] = random.choice(GA_RANGES['START'])
+            elif key == 'END': genome[key] = random.choice(GA_RANGES['END'])
+            elif key == 'SYMBOL': genome[key] = random.choice(GA_RANGES['SYMBOL'])
+    return genome
+
+def run_genetic_algorithm():
+    print(f"\n[GA] Starting Genetic Algorithm ({GA_GENERATIONS} generations, {GA_POPULATION} pop)...")
+    
+    # Initialize Population
+    population = [generate_random_genome() for _ in range(GA_POPULATION)]
+    best_genome = None
+    best_fitness = -float('inf')
+    
+    for gen in range(GA_GENERATIONS):
+        scored_pop = []
+        for i, individual in enumerate(population):
+            fit = evaluate_fitness(individual)
+            scored_pop.append((individual, fit))
+            print(f"  > Gen {gen+1} Ind {i+1}: PnL {fit:.2f}% | {individual['SYMBOL']} {individual['TIMEFRAME']}")
+        
+        # Sort by fitness desc
+        scored_pop.sort(key=lambda x: x[1], reverse=True)
+        
+        current_best, current_score = scored_pop[0]
+        if current_score > best_fitness:
+            best_fitness = current_score
+            best_genome = current_best
+            
+        print(f"[GA] Gen {gen+1} Best PnL: {current_score:.2f}%")
+        
+        # Selection & Reproduction (Elitism + Random Crossover)
+        next_pop = [current_best] # Elitism (Keep best)
+        
+        while len(next_pop) < GA_POPULATION:
+            parent1 = random.choice(scored_pop[:int(GA_POPULATION/2)])[0] # Select from top 50%
+            parent2 = random.choice(scored_pop[:int(GA_POPULATION/2)])[0]
+            child = crossover(parent1, parent2)
+            child = mutate(child)
+            next_pop.append(child)
+            
+        population = next_pop
+
+    print("\n[GA] Optimization Complete.")
+    print(f"[GA] Best Parameters Found (PnL: {best_fitness:.2f}%):")
+    for k, v in best_genome.items():
+        print(f"  {k}: {v}")
+    
+    return best_genome
 
 # ==========================================
 # LIVE TRADING LOGIC
@@ -363,11 +511,17 @@ def serve_interface(hist_data, recent_data):
                         .metric {{ font-size: 1.1em; margin: 5px 0; }}
                         .live-badge {{ background: #ff4757; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.6em; vertical-align: middle; }}
                         .pending {{ background: #eccc68; padding: 10px; border-radius: 5px; margin-bottom: 15px; }}
+                        .params {{ background: #dff9fb; padding: 10px; margin-bottom: 20px; border-radius: 5px; border: 1px solid #c7ecee; }}
                     </style>
                 </head>
                 <body>
                     <h1>Algo Trading Dashboard</h1>
                     
+                    <div class="params">
+                        <strong>Active Parameters (Optimized):</strong><br>
+                        Symbol: {SYMBOL} | Timeframe: {TIMEFRAME} | A: {A_ROUND:.3f} | C: {C_TOP} | D: {D_LEN} | E: {E_SIM:.3f}
+                    </div>
+
                     <div class="container">
                         <div class="section" style="border: 2px solid #2ed573;">
                             <h2>3. Live Forward Test <span class="live-badge">ACTIVE</span></h2>
@@ -428,34 +582,57 @@ def serve_interface(hist_data, recent_data):
             pass
 
 def main():
-    # 1. Backtest
+    global A_ROUND, C_TOP, D_LEN, E_SIM, TIMEFRAME, SYMBOL, START, END
+
+    # 1. Run Genetic Algorithm
+    best_params = run_genetic_algorithm()
+    
+    # 2. Apply Best Parameters
+    A_ROUND = best_params['A_ROUND']
+    C_TOP = best_params['C_TOP']
+    D_LEN = best_params['D_LEN']
+    E_SIM = best_params['E_SIM']
+    TIMEFRAME = best_params['TIMEFRAME']
+    SYMBOL = best_params['SYMBOL']
+    START = best_params['START']
+    END = best_params['END']
+    
+    print("="*40)
+    print(f"STARTING LIVE BOT WITH OPTIMIZED PARAMS:")
+    print(f" {SYMBOL} {TIMEFRAME} | A:{A_ROUND:.3f} C:{C_TOP} D:{D_LEN} E:{E_SIM:.3f}")
+    print("="*40)
+
+    # 3. Standard Execution (As per original script)
     raw = fetch(TIMEFRAME, SYMBOL, START, END)
     derived = deriveround(raw, A_ROUND)
     train, test = split(derived, B_SPLIT)
     
     # Train Model
     top_seqs = gettop(train, C_TOP, D_LEN)
-    if not top_seqs: return
     
     # Validate Historical
-    hist_results = completesimilarbeginnings(test, top_seqs, D_LEN, E_SIM)
+    hist_results = []
+    if top_seqs:
+        hist_results = completesimilarbeginnings(test, top_seqs, D_LEN, E_SIM)
     
     # 2. Recent 14 Days
     now = datetime.now()
     recent_raw = fetch(TIMEFRAME, SYMBOL, now - timedelta(days=14), now)
     recent_results = []
-    if len(recent_raw) > D_LEN:
+    if len(recent_raw) > D_LEN and top_seqs:
         recent_derived = deriveround(recent_raw, A_ROUND)
         recent_results = completesimilarbeginnings(recent_derived, top_seqs, D_LEN, E_SIM)
     
     # 3. Start Live Thread
-    t = threading.Thread(target=live_trading_loop, args=(top_seqs, D_LEN, E_SIM, TIMEFRAME))
-    t.daemon = True # Kills thread when main program exits
-    t.start()
+    if top_seqs:
+        t = threading.Thread(target=live_trading_loop, args=(top_seqs, D_LEN, E_SIM, TIMEFRAME))
+        t.daemon = True # Kills thread when main program exits
+        t.start()
+    else:
+        print("[WARNING] No top sequences found. Live trading will not predict anything.")
     
     # 4. Serve
     serve_interface(hist_results, recent_results)
 
 if __name__ == "__main__":
     main()
-  
