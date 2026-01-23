@@ -125,8 +125,12 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
     target_values = df_target[data_cols].values
     timestamps = df_target['timestamp'].values
     
+    # Extract raw close prices for entry/exit logging
+    close_prices = df_target['close'].values
+    
     target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=d, axis=0)
     target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
+    target_prices = np.lib.stride_tricks.sliding_window_view(close_prices, window_shape=d, axis=0)
     
     predictions = []
     
@@ -156,12 +160,20 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
             
             ts = pd.to_datetime(target_ts[i, -1])
             
+            # Prices
+            # Entry: Close of the candle BEFORE the outcome (index -2)
+            # Exit: Close of the outcome candle (index -1)
+            entry_price = target_prices[i, -2]
+            exit_price = target_prices[i, -1]
+            
             predictions.append({
                 'timestamp': ts,
                 'predicted_dir': predicted_dir,
                 'actual_ret': actual_ret,
                 'actual_dir': actual_dir,
-                'is_correct': (predicted_dir == actual_dir) and (predicted_dir != 0)
+                'is_correct': (predicted_dir == actual_dir) and (predicted_dir != 0),
+                'entry_price': entry_price,
+                'exit_price': exit_price
             })
             
     return pd.DataFrame(predictions)
@@ -200,12 +212,12 @@ def printaccuracy(predictions_df):
     # --- HTML Generation ---
     table_html = """
     <table border="1">
-    <tr><th>Date</th><th>Pred</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th></tr>
+    <tr><th>Date</th><th>Pred</th><th>Entry</th><th>Exit</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th></tr>
     """
     for _, row in active.tail(50).iterrows():
         p_str = "UP" if row['predicted_dir'] > 0 else "DOWN"
         color = "green" if row['is_correct'] else "red"
-        table_html += f"<tr><td>{row['timestamp']}</td><td>{p_str}</td><td>{row['actual_ret']:.4f}</td><td style='color:{color}'>{row['is_correct']}</td><td>{row['pnl']:.4f}</td></tr>"
+        table_html += f"<tr><td>{row['timestamp']}</td><td>{p_str}</td><td>{row['entry_price']:.2f}</td><td>{row['exit_price']:.2f}</td><td>{row['actual_ret']:.4f}</td><td style='color:{color}'>{row['is_correct']}</td><td>{row['pnl']:.4f}</td></tr>"
     table_html += "</table>"
     
     html_out = f"<h3>Accuracy: {accuracy:.2f}% ({correct}/{total})</h3><img src='data:image/png;base64,{plot_url}'/><br>{table_html}"
@@ -215,12 +227,17 @@ def printaccuracy(predictions_df):
     equity_curve = active[['timestamp', 'cum_pnl']].copy()
     equity_curve['timestamp'] = equity_curve['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
     
+    # Create full trade history for API
+    trade_history = active[['timestamp', 'predicted_dir', 'entry_price', 'exit_price', 'actual_ret', 'is_correct', 'pnl']].copy()
+    trade_history['timestamp'] = trade_history['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    
     stats_data = {
         "accuracy_percent": round(accuracy, 2),
         "total_trades": int(total),
         "correct_trades": int(correct),
         "cumulative_pnl": float(active['cum_pnl'].iloc[-1]),
         "equity_curve": equity_curve.to_dict(orient='records'),
+        "trade_history": trade_history.to_dict(orient='records'),
         "plot_base64": plot_url
     }
     
