@@ -120,8 +120,14 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
     target_values = df_target[data_cols].values
     timestamps = df_target['timestamp'].values
     
+    # Retrieve Close prices for Entry/Exit tracking
+    close_prices = df_target['close'].values
+    
     target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=d, axis=0)
     target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
+    
+    # Create sliding view for prices to match the indices of returns
+    target_closes = np.lib.stride_tricks.sliding_window_view(close_prices, window_shape=d, axis=0)
     
     predictions = []
     
@@ -151,12 +157,20 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
             
             ts = pd.to_datetime(target_ts[i, -1])
             
+            # Extract Prices
+            # Entry: Close of the last candle in context (index -2 in window D)
+            # Exit: Close of the outcome candle (index -1 in window D)
+            entry_price = target_closes[i, -2]
+            exit_price = target_closes[i, -1]
+            
             predictions.append({
                 'timestamp': ts,
                 'predicted_dir': predicted_dir,
                 'actual_ret': actual_ret,
                 'actual_dir': actual_dir,
-                'is_correct': (predicted_dir == actual_dir) and (predicted_dir != 0)
+                'is_correct': (predicted_dir == actual_dir) and (predicted_dir != 0),
+                'entry_price': entry_price,
+                'exit_price': exit_price
             })
             
     return pd.DataFrame(predictions)
@@ -190,12 +204,12 @@ def printaccuracy(predictions_df):
     
     table_html = """
     <table border="1">
-    <tr><th>Date</th><th>Pred</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th></tr>
+    <tr><th>Date</th><th>Pred</th><th>Entry</th><th>Exit</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th></tr>
     """
     for _, row in active.tail(50).iterrows():
         p_str = "UP" if row['predicted_dir'] > 0 else "DOWN"
         color = "green" if row['is_correct'] else "red"
-        table_html += f"<tr><td>{row['timestamp']}</td><td>{p_str}</td><td>{row['actual_ret']:.4f}</td><td style='color:{color}'>{row['is_correct']}</td><td>{row['pnl']:.4f}</td></tr>"
+        table_html += f"<tr><td>{row['timestamp']}</td><td>{p_str}</td><td>{row['entry_price']:.2f}</td><td>{row['exit_price']:.2f}</td><td>{row['actual_ret']:.4f}</td><td style='color:{color}'>{row['is_correct']}</td><td>{row['pnl']:.4f}</td></tr>"
     table_html += "</table>"
     
     return f"<h3>Accuracy: {accuracy:.2f}% ({correct}/{total})</h3><img src='data:image/png;base64,{plot_url}'/><br>{table_html}", active
