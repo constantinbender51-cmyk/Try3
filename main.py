@@ -264,10 +264,19 @@ def live_loop():
                     
                     exit_price = df_live.iloc[-2]['close'] # Closing price of the resolved candle
                     
-                    last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
+                    # Calculate PnL using explicit Entry/Exit prices
+                    entry_price = last_pred.get('entry_price', exit_price)
+                    raw_return = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+                    
+                    if last_pred['pred_dir'] == 0:
+                        last_pred['outcome'] = "Flat"
+                        last_pred['pnl'] = 0.0
+                    else:
+                        last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
+                        last_pred['pnl'] = last_pred['pred_dir'] * raw_return
+
                     last_pred['actual_ret'] = actual_close_ret
                     last_pred['exit_price'] = exit_price
-                    last_pred['pnl'] = last_pred['pred_dir'] * actual_close_ret
             
             # Step 2: Make NEW prediction
             # We use the D-1 CLOSED candles (ending at index -2) to predict the CURRENT OPEN candle (index -1)
