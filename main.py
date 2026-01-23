@@ -249,19 +249,38 @@ def live_loop():
             
             df_derived = deriveround(df_live)
             
-                            # Check if we have enough data to resolve
+            # Step 1: Resolve previous prediction
+            # We look at index -2 (the candle that JUST closed). 
+            # Index -1 is the current OPEN candle (volatile, incomplete).
+            if len(live_outcomes) > 0 and 'outcome' not in live_outcomes[-1]:
+                last_pred = live_outcomes[-1]
+                
+                # Check if we have enough data to resolve
                 if len(df_derived) >= 2:
-                    # Get the outcome from the candle that just closed (index -2)
-                    actual_close_ret = df_derived.iloc[-2]['close_ret']
-                    actual_dir = 1 if actual_close_ret > 0 else -1
-                    if actual_close_ret == 0: actual_dir = 0
+                    # 1. Define Exit Price first
+                    exit_price = df_live.iloc[-2]['close'] 
 
-                    exit_price = df_live.iloc[-2]['close'] # Closing price of the resolved candle
+                    # 2. Retrieve the Entry Price from the saved dictionary
+                    entry_price = last_pred.get('entry_price')
 
-                    last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
-                    last_pred['actual_ret'] = actual_close_ret
-                    last_pred['exit_price'] = exit_price
-                    last_pred['pnl'] = last_pred['pred_dir'] * actual_close_ret
+                    # 3. Calculate PnL (Only if entry_price exists and isn't 0)
+                    if entry_price and entry_price != 0:
+                        # --- THIS IS YOUR REQUESTED FORMULA ---
+                        # It works perfectly here because both prices are defined
+                        last_pred['pnl'] = last_pred['pred_dir'] * (exit_price - entry_price) / entry_price
+                        
+                        # 4. Handle other stats
+                        actual_close_ret = df_derived.iloc[-2]['close_ret']
+                        actual_dir = 1 if actual_close_ret > 0 else -1
+                        if actual_close_ret == 0: actual_dir = 0
+
+                        last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
+                        last_pred['actual_ret'] = actual_close_ret
+                        last_pred['exit_price'] = exit_price
+                    else:
+                        # Fallback if entry_price was lost
+                        last_pred['pnl'] = 0.0
+                        last_pred['outcome'] = "Error: Missing Entry"
             
             # Step 2: Make NEW prediction
             # We use the D-1 CLOSED candles (ending at index -2) to predict the CURRENT OPEN candle (index -1)
