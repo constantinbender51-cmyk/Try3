@@ -37,17 +37,19 @@ def ensure_data_dir():
 
 def get_pandas_freq(tf):
     """Maps custom timeframe string to Pandas offset alias."""
-    # Minutes
+    # Minutes: '1m' -> '1min' (Newer Pandas prefers 'min' over 'T')
     if tf.endswith('m'): 
-        return tf.replace('m', 'T')
-    # Hours
-    if tf.endswith('h'): 
-        return tf.replace('h', 'H').upper()
-    # Days
-    if tf.endswith('d'): 
-        return tf.replace('d', 'D').upper()
+        return tf.replace('m', 'min')
     
-    return '1H'
+    # Hours: '1h' -> '1h' (Newer Pandas requires lowercase 'h', 'H' is removed)
+    if tf.endswith('h'): 
+        return tf # already '1h', '4h', etc.
+    
+    # Days: '1d' -> '1D' (Calendar day uses uppercase 'D')
+    if tf.endswith('d'): 
+        return tf.replace('d', 'D')
+    
+    return '1h'
 
 def fetch_1m_data(symbol, start_year=2020, end_year=2026):
     """
@@ -126,7 +128,6 @@ def get_resampled_data(df_1m, timeframe, start_date_str, end_date_str):
         return []
 
     # 2. Resample
-    # If timeframe is 1m, no change needed (though logic handles it via '1T')
     freq = get_pandas_freq(timeframe)
     agg_dict = {
         'open': 'first',
@@ -134,8 +135,13 @@ def get_resampled_data(df_1m, timeframe, start_date_str, end_date_str):
         'low': 'min',
         'close': 'last'
     }
-    # dropna() removes empty bins (e.g. maintenance gaps)
-    df_resampled = df_subset.resample(freq).agg(agg_dict).dropna()
+    
+    try:
+        # dropna() removes empty bins (e.g. maintenance gaps)
+        df_resampled = df_subset.resample(freq).agg(agg_dict).dropna()
+    except ValueError as e:
+        print(f"Resample Error with freq '{freq}': {e}")
+        return []
 
     # 3. Convert to list of lists [O, H, L, C] for existing logic
     return df_resampled[['open', 'high', 'low', 'close']].values.tolist()
