@@ -23,7 +23,7 @@ A = 0.0          # Unused (rounding removed)
 B = 0.7          # Split % (70% training, 30% testing)
 C = 0.1          # Top % most frequent (densest) sequences to keep
 D = 4            # Sequence length (candles)
-E = 0.001        # Similarity threshold (0.1% absolute diff)
+E = 0.002        # Similarity threshold (0.1% absolute diff)
 
 # Global State
 results_html = "<h1>Initializing...</h1>"
