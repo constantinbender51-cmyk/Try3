@@ -19,18 +19,17 @@ START = '2024-01-01 00:00:00'
 END = '2024-06-01 00:00:00'
 
 # Parameters
-A = 0.0          # (Unused as rounding is removed)
+A = 0.0          # Unused (rounding removed)
 B = 0.7          # Split % (70% training, 30% testing)
 C = 0.1          # Top % most frequent (densest) sequences to keep
 D = 4            # Sequence length (candles)
-E = 0.001        # Similarity threshold (0.1% diff allowed per point)
+E = 0.001        # Similarity threshold (0.1% absolute diff)
 
 # Global State
 results_html = "<h1>Initializing...</h1>"
-live_outcomes = []  # Stores live prediction results
-model_sequences = None # Stores the trained patterns
-data_global = None     # Stores the derived dataframe
-recent_prediction = None
+live_outcomes = []
+model_sequences = None
+data_global = None
 
 # --- Functions ---
 
@@ -47,17 +46,17 @@ def fetch(timeframe, symbol, start_str, end_str):
     while current_ts < end_ts:
         try:
             candles = exchange.fetch_ohlcv(symbol, timeframe, since=current_ts, limit=1000)
-            if len(candles) == 0:  # Explicit check avoids ambiguity
+            if not candles:
                 break
             
             # Filter out candles beyond end_ts
             candles = [c for c in candles if c[0] < end_ts]
-            if len(candles) == 0:
+            if not candles:
                 break
 
             ohlc += candles
             current_ts = candles[-1][0] + 1
-            time.sleep(0.1) # Rate limit respect
+            time.sleep(0.1) 
         except Exception as e:
             print(f"Error fetching: {e}")
             break
@@ -67,13 +66,8 @@ def fetch(timeframe, symbol, start_str, end_str):
     return df
 
 def deriveround(df, a=None):
-    """
-    Applies candle(i)-candle(i-1)/candle(i-1) logic.
-    """
-    if df.empty: return df
+    """Applies returns calculation."""
     df = df.copy()
-    
-    # Calculate returns relative to previous candle of the SAME type
     cols = ['open', 'high', 'low', 'close']
     for col in cols:
         df[f'{col}_ret'] = df[col].pct_change()
@@ -82,147 +76,99 @@ def deriveround(df, a=None):
     return df
 
 def split(df, b):
-    """Splits data into b% (Split 1) and remaining (Split 2)."""
     split_idx = int(len(df) * b)
     return df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
 
 def gettop(df_split1, c, d):
-    """
-    Finds the top c% most frequent (densest) sequences in Split 1 using E similarity.
-    Treats sequences of length d as vectors.
-    """
+    """Finds dense patterns in Split 1."""
     print("Training model (finding dense patterns)...")
-    if df_split1.empty:
-        return np.array([])
     
-    # Extract relevant columns
     data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
     data_values = df_split1[data_cols].values
     
-    if len(data_values) < d:
-        return np.array([])
-
-    # Create sliding windows of length D
+    # FIX: Use axis=0 to only slide over time rows
     # Shape: (N_windows, D, 4)
-    windows = np.lib.stride_tricks.sliding_window_view(data_values, window_shape=(d, 4))
+    windows = np.lib.stride_tricks.sliding_window_view(data_values, window_shape=d, axis=0)
     
-    # Flatten the inner dimensions for distance calculation
-    # Shape: (N_windows, D*4)
     N = windows.shape[0]
     flat_windows = windows.reshape(N, -1)
     
     densities = np.zeros(N, dtype=int)
-    
-    # Optimization: Chunked broadcasting
     chunk_size = 1000
+    
     for i in range(0, N, chunk_size):
         end = min(i + chunk_size, N)
         batch = flat_windows[i:end]
         
-        # Loop through batch to save memory vs full N*N broadcast
+        # Check distance against ALL windows (sampled or blocked if too large)
+        # Using a sub-sample for comparison if N is very large to speed up
+        compare_set = flat_windows if N < 10000 else flat_windows[::5]
+        
         for j in range(len(batch)):
-            # Check deviation
-            diff = np.abs(flat_windows - batch[j])
-            # Match if ALL points in the sequence are within E
+            diff = np.abs(compare_set - batch[j])
             matches = np.all(diff < E, axis=1)
             densities[i+j] = np.sum(matches)
             
-    # Select top c%
     top_n = int(N * c)
     if top_n == 0: top_n = 1
     
-    # Get indices of top densities
     top_indices = np.argsort(densities)[-top_n:]
-    
-    # Return the actual sequences (unflattened)
     return windows[top_indices]
 
 def completesimilarbeginnings(df_target, model_patterns, e, d):
-    """
-    Predicts on df_target using the top patterns.
-    Matches first d-1 candles, predicts d-th.
-    """
+    """Predicts on df_target using the top patterns."""
     print("Running predictions...")
-    if df_target.empty or model_patterns is None or len(model_patterns) == 0:
-        return pd.DataFrame()
-
     data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
     target_values = df_target[data_cols].values
     timestamps = df_target['timestamp'].values
     
-    if len(target_values) < d:
-        return pd.DataFrame()
-
-    # Create windows from target data
-    target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=(d, 4))
-    target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=(d,))
+    # FIX: Use axis=0 to ensure correct shape (N, D, 4)
+    target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=d, axis=0)
+    target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
     
     predictions = []
     
-    # Model Patterns Split
     model_context = model_patterns[:, :d-1, :] # (K, D-1, 4)
     model_outcome = model_patterns[:, -1, :]   # (K, 4)
-    
-    # Flatten contexts for comparison
     model_context_flat = model_context.reshape(model_context.shape[0], -1)
     
-    # Iterate through target windows
     for i in range(len(target_windows)):
-        current_window = target_windows[i] # (D, 4)
-        current_context = current_window[:d-1, :] # (D-1, 4)
+        current_window = target_windows[i] # Shape (D, 4)
+        current_context = current_window[:d-1, :]
         current_context_flat = current_context.reshape(-1)
         
-        # Find matches in model patterns
         diff = np.abs(model_context_flat - current_context_flat)
-        # np.where returns a tuple, [0] gets the array
         matches_idx = np.where(np.all(diff < e, axis=1))[0]
         
         if len(matches_idx) > 0:
-            matched_outcomes = model_outcome[matches_idx] # (Num_Matches, 4)
-            
-            # Vote: Sum of close returns of matches
+            matched_outcomes = model_outcome[matches_idx]
             avg_return = np.mean(matched_outcomes[:, 3]) # Column 3 is close_ret
             
-            # Explicit casting to python native int to avoid NumPy boolean ambiguity
-            if avg_return > 0:
-                predicted_dir = 1
-            elif avg_return < 0:
-                predicted_dir = -1
-            else:
-                predicted_dir = 0
+            predicted_dir = 1 if avg_return > 0 else -1
+            if avg_return == 0: predicted_dir = 0
             
-            # Actual outcome
-            actual_ret = current_window[-1, 3] # Close ret of D-th candle
-            if actual_ret > 0:
-                actual_dir = 1
-            elif actual_ret < 0:
-                actual_dir = -1
-            else:
-                actual_dir = 0
+            # Outcome (Now correct scalar access)
+            actual_ret = current_window[-1, 3] 
+            actual_dir = 1 if actual_ret > 0 else -1
+            if actual_ret == 0: actual_dir = 0
             
             ts = pd.to_datetime(target_ts[i, -1])
-            
-            # Calculate is_correct as standard python bool
-            is_correct = (predicted_dir == actual_dir) and (predicted_dir != 0)
             
             predictions.append({
                 'timestamp': ts,
                 'predicted_dir': predicted_dir,
-                'actual_ret': float(actual_ret), 
+                'actual_ret': actual_ret,
                 'actual_dir': actual_dir,
-                'is_correct': is_correct
+                'is_correct': (predicted_dir == actual_dir) and (predicted_dir != 0)
             })
             
     return pd.DataFrame(predictions)
 
 def printaccuracy(predictions_df):
-    """Calculates metrics and prepares plots."""
     if predictions_df.empty:
         return "<h3>No predictions made (adjust E or C)</h3>", None
 
-    # Filter flat predictions
     active = predictions_df[predictions_df['predicted_dir'] != 0].copy()
-    
     if active.empty:
         return "<h3>No non-flat predictions</h3>", None
 
@@ -230,13 +176,11 @@ def printaccuracy(predictions_df):
     correct = active['is_correct'].sum()
     accuracy = (correct / total) * 100
     
-    # Calculate PnL
     active['pnl'] = active['predicted_dir'] * active['actual_ret']
     active['cum_pnl'] = active['pnl'].cumsum()
     
-    # Plotting
     plt.figure(figsize=(10, 5))
-    plt.plot(active['timestamp'], active['cum_pnl'], label='Cumulative Strategy Return')
+    plt.plot(active['timestamp'], active['cum_pnl'], label='Cumulative PnL (Strategy)')
     plt.title(f'Strategy Performance (Acc: {accuracy:.2f}%)')
     plt.grid(True)
     plt.legend()
@@ -247,7 +191,6 @@ def printaccuracy(predictions_df):
     plot_url = base64.b64encode(img.getvalue()).decode()
     plt.close()
     
-    # HTML Table
     table_html = """
     <table border="1">
     <tr><th>Date</th><th>Pred</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th></tr>
@@ -264,23 +207,19 @@ def predict_on_recent(model_patterns, df_recent, e, d):
     preds = completesimilarbeginnings(df_recent, model_patterns, e, d)
     return preds
 
-# --- Live Loop Logic ---
+# --- Live Loop ---
 
 def get_seconds_to_sleep(timeframe):
     now = datetime.utcnow()
     unit = timeframe[-1]
     val = int(timeframe[:-1])
     
-    if unit == 'm':
-        delta = timedelta(minutes=val)
-    elif unit == 'h':
-        delta = timedelta(hours=val)
-    elif unit == 'd':
-        delta = timedelta(days=val)
-    else:
-        delta = timedelta(hours=1)
+    if unit == 'm': delta = timedelta(minutes=val)
+    elif unit == 'h': delta = timedelta(hours=val)
+    elif unit == 'd': delta = timedelta(days=val)
+    else: delta = timedelta(hours=1)
 
-    # Calculate target
+    # Calculate next close alignment
     if unit == 'h':
         next_hour = now.replace(minute=0, second=0, microsecond=0) + delta
         while next_hour < now: next_hour += delta
@@ -293,7 +232,7 @@ def get_seconds_to_sleep(timeframe):
         target = now + delta
 
     seconds = (target - now).total_seconds() + 5 
-    return max(1, seconds) 
+    return max(0, seconds)
 
 def live_loop():
     global live_outcomes
@@ -307,41 +246,29 @@ def live_loop():
             exchange = ccxt.binance()
             limit = D * 5
             candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
-            
-            if len(candles) == 0:
-                print("Live Loop: No candles returned.")
-                continue
-
             df_live = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_live['timestamp'] = pd.to_datetime(df_live['timestamp'], unit='ms')
             
-            # Derive
             df_derived = deriveround(df_live)
             
-            if df_derived.empty or len(df_derived) < D:
-                print("Live Loop: Not enough data yet.")
-                continue
-
-            # Step 1: Check outcome of PREVIOUS prediction
+            # Step 1: Resolve previous prediction
             if len(live_outcomes) > 0 and 'outcome' not in live_outcomes[-1]:
                 last_pred = live_outcomes[-1]
-                # The candle that just closed is at index -1
+                # The prediction was made for the candle that just closed (index -1)
                 actual_close_ret = df_derived.iloc[-1]['close_ret']
+                actual_dir = 1 if actual_close_ret > 0 else -1
+                if actual_close_ret == 0: actual_dir = 0
                 
-                if actual_close_ret > 0: actual_dir = 1
-                elif actual_close_ret < 0: actual_dir = -1
-                else: actual_dir = 0
-                
-                last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir) and (last_pred['pred_dir'] != 0)
-                last_pred['actual_ret'] = float(actual_close_ret)
+                last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
+                last_pred['actual_ret'] = actual_close_ret
                 last_pred['pnl'] = last_pred['pred_dir'] * actual_close_ret
             
-            # Step 2: Make NEW prediction for current open candle using previous D-1 closed candles
-            # We use the last D-1 candles from the dataframe
-            recent_context = df_derived.iloc[-(D-1):][['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
-            recent_context_flat = recent_context.reshape(-1)
-            
-            if model_sequences is not None and len(model_sequences) > 0:
+            # Step 2: Make NEW prediction
+            if len(df_derived) >= D-1:
+                # We use the most recent closed D-1 candles to predict the NEXT open candle
+                recent_context = df_derived.iloc[-(D-1):][['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
+                recent_context_flat = recent_context.reshape(-1)
+                
                 model_context = model_sequences[:, :D-1, :]
                 model_context_flat = model_context.reshape(model_context.shape[0], -1)
                 
@@ -351,22 +278,20 @@ def live_loop():
                 if len(matches_idx) > 0:
                     model_outcomes = model_sequences[matches_idx, -1, :]
                     avg_ret = np.mean(model_outcomes[:, 3])
-                    
-                    if avg_ret > 0: pred_dir = 1
-                    elif avg_ret < 0: pred_dir = -1
-                    else: pred_dir = 0
+                    pred_dir = 1 if avg_ret > 0 else -1
+                    if avg_ret == 0: pred_dir = 0
                     
                     live_outcomes.append({
                         'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
                         'pred_dir': pred_dir,
-                        'matches': int(len(matches_idx))
+                        'matches': len(matches_idx)
                     })
                 else:
                     live_outcomes.append({
                         'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
                         'pred_dir': 0,
                         'matches': 0,
-                        'note': 'Flat/No Match'
+                        'note': 'No Match'
                     })
             
             if len(live_outcomes) > 336:
@@ -386,11 +311,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         for item in reversed(live_outcomes):
             outcome_str = item.get('outcome', 'Pending...')
             pnl_str = f"{item.get('pnl', 0):.4f}" if 'pnl' in item else "-"
-            
-            p_dir = item.get('pred_dir', 0)
-            pred_s = "UP" if p_dir == 1 else ("DOWN" if p_dir == -1 else "FLAT")
-            
-            live_html += f"<tr><td>{item['time']}</td><td>{pred_s}</td><td>{item.get('matches',0)}</td><td>{outcome_str}</td><td>{pnl_str}</td></tr>"
+            pred_s = "UP" if item['pred_dir'] == 1 else ("DOWN" if item['pred_dir'] == -1 else "FLAT")
+            live_html += f"<tr><td>{item['time']}</td><td>{pred_s}</td><td>{item['matches']}</td><td>{outcome_str}</td><td>{pnl_str}</td></tr>"
         live_html += "</table>"
         
         full_page = f"""
@@ -420,10 +342,6 @@ def main():
     global model_sequences, results_html, data_global
     
     df = fetch(TIMEFRAME, SYMBOL, START, END)
-    if df.empty:
-        print("No data fetched. Exiting.")
-        return
-
     df_derived = deriveround(df, A)
     data_global = df_derived
     
