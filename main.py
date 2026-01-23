@@ -86,7 +86,6 @@ def gettop(df_split1, c, d):
     data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
     data_values = df_split1[data_cols].values
     
-    # FIX: Use axis=0 to only slide over time rows
     # Shape: (N_windows, D, 4)
     windows = np.lib.stride_tricks.sliding_window_view(data_values, window_shape=d, axis=0)
     
@@ -101,7 +100,6 @@ def gettop(df_split1, c, d):
         batch = flat_windows[i:end]
         
         # Check distance against ALL windows (sampled or blocked if too large)
-        # Using a sub-sample for comparison if N is very large to speed up
         compare_set = flat_windows if N < 10000 else flat_windows[::5]
         
         for j in range(len(batch)):
@@ -122,7 +120,6 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
     target_values = df_target[data_cols].values
     timestamps = df_target['timestamp'].values
     
-    # FIX: Use axis=0 to ensure correct shape (N, D, 4)
     target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=d, axis=0)
     target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
     
@@ -147,7 +144,7 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
             predicted_dir = 1 if avg_return > 0 else -1
             if avg_return == 0: predicted_dir = 0
             
-            # Outcome (Now correct scalar access)
+            # Outcome
             actual_ret = current_window[-1, 3] 
             actual_dir = 1 if actual_ret > 0 else -1
             if actual_ret == 0: actual_dir = 0
@@ -245,6 +242,7 @@ def live_loop():
             print("Live Loop: Fetching latest data...")
             exchange = ccxt.binance()
             limit = D * 5
+            # Fetch data (binance usually returns the current open candle as the last element)
             candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
             df_live = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_live['timestamp'] = pd.to_datetime(df_live['timestamp'], unit='ms')
@@ -252,21 +250,30 @@ def live_loop():
             df_derived = deriveround(df_live)
             
             # Step 1: Resolve previous prediction
+            # We look at index -2 (the candle that JUST closed). 
+            # Index -1 is the current OPEN candle (volatile, incomplete).
             if len(live_outcomes) > 0 and 'outcome' not in live_outcomes[-1]:
                 last_pred = live_outcomes[-1]
-                # The prediction was made for the candle that just closed (index -1)
-                actual_close_ret = df_derived.iloc[-1]['close_ret']
-                actual_dir = 1 if actual_close_ret > 0 else -1
-                if actual_close_ret == 0: actual_dir = 0
                 
-                last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
-                last_pred['actual_ret'] = actual_close_ret
-                last_pred['pnl'] = last_pred['pred_dir'] * actual_close_ret
+                # Check if we have enough data to resolve
+                if len(df_derived) >= 2:
+                    # Get the outcome from the candle that just closed (index -2)
+                    actual_close_ret = df_derived.iloc[-2]['close_ret']
+                    actual_dir = 1 if actual_close_ret > 0 else -1
+                    if actual_close_ret == 0: actual_dir = 0
+                    
+                    exit_price = df_live.iloc[-2]['close'] # Closing price of the resolved candle
+                    
+                    last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
+                    last_pred['actual_ret'] = actual_close_ret
+                    last_pred['exit_price'] = exit_price
+                    last_pred['pnl'] = last_pred['pred_dir'] * actual_close_ret
             
             # Step 2: Make NEW prediction
-            if len(df_derived) >= D-1:
-                # We use the most recent closed D-1 candles to predict the NEXT open candle
-                recent_context = df_derived.iloc[-(D-1):][['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
+            # We use the D-1 CLOSED candles (ending at index -2) to predict the CURRENT OPEN candle (index -1)
+            # We must use slice -D:-1 to ignore the last volatile row
+            if len(df_derived) >= D:
+                recent_context = df_derived.iloc[-D:-1][['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
                 recent_context_flat = recent_context.reshape(-1)
                 
                 model_context = model_sequences[:, :D-1, :]
@@ -274,6 +281,9 @@ def live_loop():
                 
                 diff = np.abs(model_context_flat - recent_context_flat)
                 matches_idx = np.where(np.all(diff < E, axis=1))[0]
+                
+                # Entry price is the Close of the last closed candle (which is the Open of our prediction candle)
+                entry_price = df_live.iloc[-2]['close']
                 
                 if len(matches_idx) > 0:
                     model_outcomes = model_sequences[matches_idx, -1, :]
@@ -284,14 +294,16 @@ def live_loop():
                     live_outcomes.append({
                         'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
                         'pred_dir': pred_dir,
-                        'matches': len(matches_idx)
+                        'matches': len(matches_idx),
+                        'entry_price': entry_price
                     })
                 else:
                     live_outcomes.append({
                         'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
                         'pred_dir': 0,
                         'matches': 0,
-                        'note': 'No Match'
+                        'note': 'No Match',
+                        'entry_price': entry_price
                     })
             
             if len(live_outcomes) > 336:
@@ -307,12 +319,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         global results_html, live_outcomes
         
-        live_html = "<h2>Live Outcomes (Last 2 weeks)</h2><table border='1'><tr><th>Time</th><th>Pred</th><th>Matches</th><th>Outcome</th><th>PnL</th></tr>"
+        live_html = "<h2>Live Outcomes (Last 2 weeks)</h2><table border='1'><tr><th>Time</th><th>Pred</th><th>Matches</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>"
         for item in reversed(live_outcomes):
             outcome_str = item.get('outcome', 'Pending...')
             pnl_str = f"{item.get('pnl', 0):.4f}" if 'pnl' in item else "-"
+            entry_s = f"{item.get('entry_price', 0):.2f}"
+            exit_s = f"{item.get('exit_price', 0):.2f}" if 'exit_price' in item else "-"
+            
             pred_s = "UP" if item['pred_dir'] == 1 else ("DOWN" if item['pred_dir'] == -1 else "FLAT")
-            live_html += f"<tr><td>{item['time']}</td><td>{pred_s}</td><td>{item['matches']}</td><td>{outcome_str}</td><td>{pnl_str}</td></tr>"
+            live_html += f"<tr><td>{item['time']}</td><td>{pred_s}</td><td>{item['matches']}</td><td>{entry_s}</td><td>{exit_s}</td><td>{outcome_str}</td><td>{pnl_str}</td></tr>"
         live_html += "</table>"
         
         full_page = f"""
