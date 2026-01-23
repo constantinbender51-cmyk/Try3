@@ -72,17 +72,17 @@ def ensure_data_dir():
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
-def fetch_1m_data(symbol):
+def fetch_1m_data(symbol, quiet=False):
     """Fetches or loads 1m data for the full range (2020-2026)."""
     ensure_data_dir()
     file_path = os.path.join(DATA_DIR, f"{symbol}_1m.csv")
     
     if os.path.exists(file_path):
-        print(f"[DATA] Loading cached {symbol} 1m data...")
+        if not quiet: print(f"[DATA] Loading cached {symbol} 1m data...")
         df = pd.read_csv(file_path, index_col=0, parse_dates=True)
         return df
         
-    print(f"[DATA] Downloading full history for {symbol} (1m)...")
+    if not quiet: print(f"[DATA] Downloading full history for {symbol} (1m)...")
     base_url = "https://api.binance.com/api/v3/klines"
     
     # Fetch range 2020 to 2026
@@ -109,13 +109,53 @@ def fetch_1m_data(symbol):
             current_start = klines[-1][6] + 1
             time.sleep(0.05) # Prevent rate limit
         except Exception as e:
-            print(f"Error fetching: {e}")
+            if not quiet: print(f"Error fetching: {e}")
             break
             
     df = pd.DataFrame(data, columns=['datetime', 'open', 'high', 'low', 'close'])
     df.set_index('datetime', inplace=True)
     df.to_csv(file_path)
     return df
+
+def fetch(timeframe, symbol, start, end, limit=1000, quiet=False):
+    """
+    Optimized Fetch: Loads 1m cache, resamples to requested timeframe.
+    """
+    now = datetime.now()
+    if isinstance(start, str): start_dt = pd.Timestamp(start)
+    else: start_dt = start
+    
+    # If requesting recent data (less than 2 days ago), hit API to be safe
+    if (now - start_dt).total_seconds() < 172800:
+        return fetch_api_direct(timeframe, symbol, start, end, limit, quiet)
+
+    # Historical / Backtest: Use Cache
+    try:
+        # PASS QUIET HERE TO SILENCE WORKERS
+        df = fetch_1m_data(symbol, quiet=quiet)
+        
+        # Resample
+        tf_map = {'m': 'min', 'h': 'h', 'd': 'D'}
+        rule = f"{timeframe[:-1]}{tf_map[timeframe[-1]]}"
+        
+        resampled = df.resample(rule).agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+        }).dropna()
+        
+        # Filter Date
+        if isinstance(start, str): start_ts = pd.Timestamp(start)
+        else: start_ts = start
+        if isinstance(end, str): end_ts = pd.Timestamp(end)
+        else: end_ts = end
+        
+        mask = (resampled.index >= start_ts) & (resampled.index < end_ts)
+        sliced = resampled.loc[mask]
+        
+        return sliced.values.tolist()
+        
+    except Exception as e:
+        if not quiet: print(f"[WARN] Cache failed ({e}), falling back to API.")
+        return fetch_api_direct(timeframe, symbol, start, end, limit, quiet)
 
 def fetch(timeframe, symbol, start, end, limit=1000, quiet=False):
     """
@@ -306,7 +346,6 @@ def run_grid_search():
     print(f"Goal: Maximize (Accuracy * Trades)")
     print("="*50)
     
-    # Generate Data Combinations (Outer Loop)
     data_configs = list(itertools.product(
         GRID_PARAMS['SYMBOL'],
         GRID_PARAMS['TIMEFRAME'],
@@ -315,7 +354,6 @@ def run_grid_search():
         GRID_PARAMS['A_ROUND']
     ))
     
-    # Generate Logic Combinations (Inner Loop)
     logic_configs = list(itertools.product(
         GRID_PARAMS['C_TOP'],
         GRID_PARAMS['D_LEN'],
@@ -323,20 +361,16 @@ def run_grid_search():
     ))
     
     tasks = []
-    # Bundle tasks: Each worker handles one Data Config and ALL logic configs for it
-    # This minimizes data fetching overhead
     for d_conf in data_configs:
-        # Check start < end year to avoid invalid ranges
         s_y = int(d_conf[2][:4])
         e_y = int(d_conf[3][:4])
         if s_y >= e_y: continue
-        
         tasks.append(d_conf + (logic_configs,))
 
     print(f"Total Data Scenarios: {len(tasks)}")
     print(f"Logic Variants per Scenario: {len(logic_configs)}")
     print(f"Total Combinations: {len(tasks) * len(logic_configs)}")
-    print("Processing... (This may take a while)\n")
+    print("Processing... (Check logs every 50 items)\n")
 
     best_score = -1
     best_config = None
@@ -344,13 +378,14 @@ def run_grid_search():
     cpu_cores = multiprocessing.cpu_count()
     pool = multiprocessing.Pool(processes=cpu_cores)
     
-    # Process
     counter = 0
     total = len(tasks)
     
+    # FIXED LOGGING: Print only every 10 items, use flush=True, no \r
     for result_batch in pool.imap_unordered(evaluate_config, tasks):
         counter += 1
-        print(f"Progress: {counter}/{total} scenarios checked...", end='\r')
+        if counter % 10 == 0 or counter == total:
+            print(f"[GRID] Progress: {counter}/{total} scenarios checked...", flush=True)
         
         if not result_batch: continue
         
@@ -358,6 +393,7 @@ def run_grid_search():
             if res['score'] > best_score:
                 best_score = res['score']
                 best_config = res
+                # Print new bests immediately
                 print(f"\n>> NEW BEST: Score {best_score:.2f} | Acc: {res['acc']:.2%}, Trades: {res['valid']}")
                 p = res['params']
                 print(f"   {p[0]} {p[1]} {p[2]}-{p[3]} | A:{p[4]} C:{p[5]} D:{p[6]} E:{p[7]}")
