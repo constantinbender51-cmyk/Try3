@@ -249,21 +249,15 @@ def live_loop():
             
             df_derived = deriveround(df_live)
             
-            # Step 1: Resolve previous prediction
-            # We look at index -2 (the candle that JUST closed). 
-            # Index -1 is the current OPEN candle (volatile, incomplete).
-            if len(live_outcomes) > 0 and 'outcome' not in live_outcomes[-1]:
-                last_pred = live_outcomes[-1]
-                
-                # Check if we have enough data to resolve
+                            # Check if we have enough data to resolve
                 if len(df_derived) >= 2:
                     # Get the outcome from the candle that just closed (index -2)
                     actual_close_ret = df_derived.iloc[-2]['close_ret']
                     actual_dir = 1 if actual_close_ret > 0 else -1
                     if actual_close_ret == 0: actual_dir = 0
-                    
+
                     exit_price = df_live.iloc[-2]['close'] # Closing price of the resolved candle
-                    
+
                     last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
                     last_pred['actual_ret'] = actual_close_ret
                     last_pred['exit_price'] = exit_price
